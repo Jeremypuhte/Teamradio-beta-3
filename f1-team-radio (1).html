@@ -1,0 +1,204 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="F1 Radio">
+<meta name="theme-color" content="#0b0b0f">
+<title>F1 Team Radio</title>
+<style>
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{height:100%;margin:0}
+body{background:#0b0b0f;color:#eee;font-family:-apple-system,system-ui,sans-serif;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:22px;padding:env(safe-area-inset-top) 20px env(safe-area-inset-bottom);text-align:center}
+h1{margin:0;font-size:28px;letter-spacing:4px;font-weight:800;max-width:100%;overflow-wrap:anywhere;text-transform:uppercase}
+h1 span{color:#e10600}
+input{font-size:20px;padding:14px;border-radius:12px;border:1px solid #333;background:#16161c;color:#fff;width:260px;text-align:center}
+button{font-size:18px;font-weight:700;letter-spacing:2px;padding:14px 34px;border:0;border-radius:12px;background:#e10600;color:#fff}
+button:disabled{opacity:.5}
+#room{display:none;flex-direction:column;align-items:center;gap:22px}
+#orb{touch-action:none;user-select:none;-webkit-user-select:none;-webkit-touch-callout:none;width:170px;height:170px;border-radius:50%;border:4px solid #2a2a33;display:flex;align-items:center;justify-content:center;font-size:15px;color:#888;transition:.15s}
+#orb.on{border-color:#e10600;box-shadow:0 0 50px #e10600aa;color:#fff}
+#st{font-size:14px;color:#9a9aa5;min-height:18px}
+label{font-size:13px;color:#9a9aa5;display:flex;flex-direction:column;gap:6px;align-items:center}
+input[type=range]{width:220px;padding:0}
+small{color:#666;max-width:300px}
+</style>
+</head>
+<body>
+<h1 id="title">TEAM <span>RADIO</span></h1>
+<div id="join" style="display:flex;flex-direction:column;align-items:center;gap:18px">
+  <input id="team" placeholder="Teamname (z. B. Red Bull)" maxlength="20" autocomplete="off">
+  <input id="code" placeholder="Raumcode" maxlength="20" autocapitalize="off" autocomplete="off">
+  <button id="go">VERBINDEN</button>
+  <small>Der Raumcode bestimmt, wer zusammen funkt. Den Teamnamen kannst du frei wählen. Lässt du ihn leer, übernimmst du den Namen des Teams, das den Raum erstellt hat. Am besten mit Kopfhörern, sonst gibt es Rückkopplung.</small>
+</div>
+<div id="room">
+  <div id="orb">Stille</div>
+  <div id="st"></div>
+  <label style="flex-direction:row;gap:10px;font-size:15px;color:#ccc"><input type="checkbox" id="ptt" style="width:auto"> Push-to-Talk (Kreis gedrückt halten)</label>
+  <label>Mikro-Empfindlichkeit<input id="sens" type="range" min="1" max="20" value="8"></label>
+  <button id="leave">VERLASSEN</button>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js"></script>
+<script>
+const $=id=>document.getElementById(id);
+let ctx,mic,txDest,tx,peer,base,teamName='',noiseBuf,thr=0.03,quietUntil=0,active=0,ptt=false,pttOn=false,wl=null;
+
+// zuletzt benutzten Teamnamen merken
+try{
+  const t=localStorage.getItem('f1radio-team'),c=localStorage.getItem('f1radio-code');
+  if(t)$('team').value=t;if(c)$('code').value=c;
+}catch(e){}
+
+// Teamname in Überschrift setzen (leer = neutraler Titel)
+function setTeam(name){
+  teamName=name;
+  const t=$('title');t.textContent='';
+  if(name){const sp=document.createElement('span');sp.textContent=name;t.append(sp,' RADIO')}
+  else{t.append('TEAM ');const sp=document.createElement('span');sp.textContent='RADIO';t.append(sp)}
+}
+
+async function keepAwake(){try{wl=await navigator.wakeLock.request('screen')}catch(e){}}
+document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='visible'&&mic)keepAwake()});
+function pttSet(on){
+  if(!ptt||on===pttOn)return;
+  pttOn=on;mic.getAudioTracks()[0].enabled=on;beep(on);setActive(on?1:-1);
+}
+$('ptt').onchange=e=>{
+  ptt=e.target.checked;mic.getAudioTracks()[0].enabled=!ptt;
+  if(!ptt&&pttOn){pttOn=false;setActive(-1)}
+};
+const orbEl=$('orb');
+orbEl.addEventListener('pointerdown',e=>{e.preventDefault();pttSet(true)});
+['pointerup','pointercancel','pointerleave'].forEach(n=>orbEl.addEventListener(n,()=>pttSet(false)));
+const calls={},members=[],vads=[];
+
+$('sens').oninput=e=>{thr=0.06-e.target.value*0.0027}; // 1=unempfindlich ... 20=empfindlich
+$('sens').oninput({target:$('sens')});
+
+function curve(k){const n=256,c=new Float32Array(n);for(let i=0;i<n;i++){const x=i*2/n-1;c[i]=(3+k)*x*20*(Math.PI/180)/(Math.PI+k*Math.abs(x))}return c}
+
+function beep(start){
+  const t=ctx.currentTime;quietUntil=performance.now()+(start?900:600);
+  const bus=ctx.createGain(),bp=ctx.createBiquadFilter(),ws=ctx.createWaveShaper(),out=ctx.createGain();
+  bp.type='bandpass';bp.frequency.value=1500;bp.Q.value=.6;ws.curve=curve(10);out.gain.value=1.6;
+  bus.connect(txDest);                                   // geht an alle anderen im Raum
+  bus.connect(bp);bp.connect(ws);ws.connect(out);out.connect(ctx.destination); // und du hörst es selbst
+  const du=(at,f)=>{const o=ctx.createOscillator(),g=ctx.createGain();o.type='triangle';o.frequency.value=f;
+    g.gain.setValueAtTime(0,at);g.gain.linearRampToValueAtTime(.5,at+.006);
+    g.gain.exponentialRampToValueAtTime(.001,at+.075);
+    o.connect(g).connect(bus);o.start(at);o.stop(at+.09)};
+  const noise=(at,dur,vol)=>{const n=ctx.createBufferSource(),g=ctx.createGain();n.buffer=noiseBuf;
+    g.gain.setValueAtTime(vol,at);g.gain.exponentialRampToValueAtTime(.001,at+dur);
+    n.connect(g).connect(bus);n.start(at);n.stop(at+dur+.02)};
+  if(start){for(let i=0;i<4;i++)du(t+i*.1,900)}          // du du du du
+  else{du(t,700);noise(t+.07,.18,.3)}                     // Abschluss
+}
+
+function radioChain(stream){
+  const src=ctx.createMediaStreamSource(stream),
+    hp=ctx.createBiquadFilter(),lp=ctx.createBiquadFilter(),
+    ws=ctx.createWaveShaper(),comp=ctx.createDynamicsCompressor(),g=ctx.createGain();
+  hp.type='highpass';hp.frequency.value=500;
+  lp.type='lowpass';lp.frequency.value=3200;
+  ws.curve=curve(30);g.gain.value=1.5;
+  src.connect(hp);hp.connect(lp);lp.connect(ws);ws.connect(comp);comp.connect(g);g.connect(ctx.destination);
+  // Chrome-Workaround: Stream muss an ein Audio-Element hängen, damit WebAudio Daten bekommt
+  const a=new Audio();a.muted=true;a.srcObject=stream;a.play().catch(()=>{});
+}
+
+function setActive(d){active=Math.max(0,active+d);const o=$('orb');o.classList.toggle('on',active>0);o.textContent=active>0?'● FUNK':'Stille'}
+
+function addVad(stream,local){
+  const an=ctx.createAnalyser();an.fftSize=1024;
+  const hp=ctx.createBiquadFilter(),lp=ctx.createBiquadFilter();
+  hp.type='highpass';hp.frequency.value=300;   // Motorbrummen raus
+  lp.type='lowpass';lp.frequency.value=3000;   // Zischen/Wind raus
+  ctx.createMediaStreamSource(stream).connect(hp);hp.connect(lp);lp.connect(an);
+  const buf=new Uint8Array(an.fftSize),v={on:false,last:0,since:0,nf:0.01,dead:false,
+    tick(now){
+      if(local&&(now<quietUntil||(ptt&&!v.on)))return;
+      an.getByteTimeDomainData(buf);let s=0;
+      for(const b of buf){const x=(b-128)/128;s+=x*x}
+      const r=Math.sqrt(s/buf.length);
+      const limit=Math.max(thr,v.nf*3); // passt sich dem Dauer-Lärm an
+      if(r>limit){
+        v.last=now;if(!v.since)v.since=now;
+        if(!v.on&&now-v.since>150){v.on=true;if(local)beep(true);setActive(1)} // erst nach 150 ms Sprache
+      }else{
+        v.since=0;
+        if(!v.on)v.nf=Math.min(0.08,v.nf*0.97+r*0.03);
+        if(v.on&&now-v.last>800){v.on=false;if(local)beep(false);setActive(-1)}
+      }
+    }};
+  vads.push(v);return v;
+}
+setInterval(()=>{const n=performance.now();vads.forEach(v=>v.tick(n))},50);
+
+function count(){$('st').textContent=(Object.keys(calls).length+1)+' im Raum: '+base.replace('f1radio-','')}
+
+function attach(call){
+  call.on('stream',s=>{
+    if(calls[call.peer])return;
+    calls[call.peer]=call;call.vad=addVad(s,false);radioChain(s);count();
+  });
+  call.on('close',()=>{
+    if(call.vad){call.vad.dead=true;const i=vads.indexOf(call.vad);if(i>-1)vads.splice(i,1);if(call.vad.on)setActive(-1)}
+    delete calls[call.peer];count();
+  });
+}
+
+function init(asHost){
+  peer=asHost?new Peer(base+'-host'):new Peer();
+  peer.on('open',()=>{
+    $('st').textContent=asHost?'Raum erstellt, warte auf andere...':'Verbinde...';
+    if(!asHost){
+      const c=peer.connect(base+'-host',{reliable:true});
+      c.on('data',d=>{
+        if(d.t!=='list')return;
+        if(!teamName&&d.team)setTeam(d.team); // Teamnamen vom Raum übernehmen
+        d.ids.forEach(id=>{if(!calls[id])attach(peer.call(id,tx))});
+      });
+    }
+  });
+  peer.on('call',call=>{call.answer(tx);attach(call)});
+  peer.on('connection',c=>{
+    if(!asHost)return;
+    c.on('open',()=>{c.send({t:'list',team:teamName,ids:[peer.id].concat(members)});members.push(c.peer)});
+    c.on('close',()=>{const i=members.indexOf(c.peer);if(i>-1)members.splice(i,1)});
+  });
+  peer.on('error',e=>{
+    if(e.type==='unavailable-id'&&asHost){peer.destroy();init(false)}
+    else if(e.type!=='peer-unavailable')$('st').textContent='Fehler: '+e.type;
+  });
+}
+
+$('go').onclick=async()=>{
+  const room=$('code').value.toLowerCase().replace(/[^a-z0-9]/g,'');
+  if(!room){$('code').focus();return}
+  const name=$('team').value.trim();
+  $('go').disabled=true;
+  try{
+    ctx=new (window.AudioContext||window.webkitAudioContext)();ctx.resume(); // direkt im Tap, wichtig für iOS
+    noiseBuf=ctx.createBuffer(1,ctx.sampleRate,ctx.sampleRate);
+    const d=noiseBuf.getChannelData(0);for(let i=0;i<d.length;i++)d[i]=Math.random()*2-1;
+    mic=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true,noiseSuppression:true,autoGainControl:true}});
+  }catch(e){alert('Mikrofon nicht erlaubt oder nicht verfügbar. Bitte Zugriff erlauben und neu laden.');$('go').disabled=false;return}
+  try{localStorage.setItem('f1radio-team',name);localStorage.setItem('f1radio-code',$('code').value.trim())}catch(e){}
+  base='f1radio-'+room;
+  setTeam(name);
+  txDest=ctx.createMediaStreamDestination();ctx.createMediaStreamSource(mic).connect(txDest);tx=txDest.stream;
+  addVad(mic,true);
+  $('join').style.display='none';$('room').style.display='flex';
+  keepAwake();
+  init(true);
+};
+
+$('leave').onclick=()=>location.reload();
+</script>
+</body>
+</html>
